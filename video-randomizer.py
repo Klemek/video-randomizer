@@ -1,22 +1,23 @@
 #!/usr/bin/python3
 
+import typing
 import cv2
 import os
 import math
 import argparse
-from typing import *
 import tempfile
 import hashlib
 import random
 import subprocess
 import time
 import sys
+import shutil
 
 CWD = os.path.abspath(os.path.dirname(__file__))
 
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        prog="video-randomizer",
         description="randomize videos by taking small random samples and merging them together",
     )
     parser.add_argument(
@@ -83,7 +84,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "-qf",
-        "--ffmpeg-quiet",
+        "--quiet-ffmpeg",
         action="store_true",
         default=False,
         help="do not output ffmpeg stdout",
@@ -102,11 +103,12 @@ def parse_args() -> argparse.Namespace:
         help="random seed",
     )
     parser.add_argument(
-        "file",
+        "--ffmpeg",
         type=str,
-        nargs='+',
-        help='input files'
+        default=None,
+        help="ffmpeg binary path (default is found on PATH)",
     )
+    parser.add_argument("file", type=str, nargs="+", help="input files")
     return parser.parse_args()
 
 
@@ -122,38 +124,33 @@ def get_video_frame_count(path: str) -> int:
     return cv2.VideoCapture(path).get(cv2.CAP_PROP_FRAME_COUNT)
 
 
-
 def get_timestamp(frame_number: int, framerate: float) -> str:
     t = frame_number / framerate
     return f"{t//60:.0f}:{t%60:.3f}"
 
 
-def execute(cmd: List[str]) -> Generator[str, None, None]:
-    popen = subprocess.Popen(cmd, stdout=subprocess.PIPE, universal_newlines=True)
-    if popen.stdout is not None:
-        for stdout_line in iter(popen.stdout.readline, ""):
-            yield stdout_line 
-        popen.stdout.close()
-    return_code = popen.wait()
-    if return_code:
-        raise subprocess.CalledProcessError(return_code, cmd)
-
-def execute_and_print(cmd: List[str]) -> None:
-    for line in execute(cmd):
-        print(line)
+def execute(cmd: typing.List[str], silent: bool = False) -> int:
+    out = subprocess.DEVNULL if silent else None
+    popen = subprocess.Popen(cmd, stdout=out, stderr=out, universal_newlines=True)
+    return popen.wait()
 
 
-def execute_with_args(cmd: List[str], args: argparse.Namespace) -> bool:
+def get_ffmpeg_bin(args: argparse.Namespace) -> str:
+    if args.ffmpeg and os.path.exists(args.ffmpeg):
+        return args.ffmpeg
+    path = shutil.which("ffmpeg")
+    if not path:
+        print("ffmpeg not found on PATH")
+        sys.exit(1)
+    return path
+
+
+def ffmpeg(parameters: typing.List[str], args: argparse.Namespace) -> bool:
+    ffmpeg_bin = get_ffmpeg_bin(args)
+    cmd = [ffmpeg_bin] + parameters
     if not args.quiet:
         print(f"$ {' '.join(cmd)}")
-    try:
-        if args.quiet or args.ffmpeg_quiet:
-            execute(cmd)
-        else:
-            execute_and_print(cmd)
-        return True
-    except subprocess.CalledProcessError:
-        return False
+    return execute(cmd, args.quiet or args.quiet_ffmpeg) == 0
 
 
 def get_scale(args: argparse.Namespace) -> str:
@@ -177,20 +174,36 @@ def get_output_file(args: argparse.Namespace) -> str:
 
 
 def get_build_dir(args: argparse.Namespace) -> str:
-    path = os.path.join(os.getcwd(), f"build_{get_scale(args).replace(':','x')}_{args.framerate}fps")
+    path = os.path.join(
+        os.getcwd(), f"build_{get_scale(args).replace(':','x')}_{args.framerate}fps"
+    )
     if not os.path.exists(path):
         os.mkdir(path)
     return path
 
 
 def convert_video(in_path: str, out_path: str, args: argparse.Namespace) -> bool:
-    cmd = [
-        'ffmpeg', '-y', '-f', 'mp4', '-i', in_path, '-c:v', 'libx264', '-vf', f'scale={get_scale(args)},fps={args.framerate}', '-crf', str(args.crf), '-video_track_timescale', '90000', '-an', out_path 
+    parameters = [
+        "-y",
+        "-f",
+        "mp4",
+        "-i",
+        in_path,
+        "-c:v",
+        "libx264",
+        "-vf",
+        f"scale={get_scale(args)},fps={args.framerate}",
+        "-crf",
+        str(args.crf),
+        "-video_track_timescale",
+        "90000",
+        "-an",
+        out_path,
     ]
-    return execute_with_args(cmd, args)
+    return ffmpeg(parameters, args)
 
 
-def convert_all_videos(build_dir: str, args: argparse.Namespace) -> List[str]:
+def convert_all_videos(build_dir: str, args: argparse.Namespace) -> typing.List[str]:
     converted = []
     to_convert = []
     for path in args.file:
@@ -210,15 +223,18 @@ def convert_all_videos(build_dir: str, args: argparse.Namespace) -> List[str]:
             in_path, out_path = data
             result = convert_video(in_path, out_path, args)
             if not args.quiet:
-                print(f"[{i + 1} / {len(to_convert)}] {'OK' if result else 'KO'} {in_path} -> {out_path}")
+                print(
+                    f"[{i + 1} / {len(to_convert)}] {'OK' if result else 'KO'} {in_path} -> {out_path}"
+                )
             if result:
                 converted += [out_path]
     return converted
 
 
-def generate_concat_file(videos: List[str], args: argparse.Namespace) -> str:
+def generate_concat_file(videos: typing.List[str], args: argparse.Namespace) -> str:
     random.seed(args.seed)
-    print(f"Random seed: {args.seed}")
+    if not args.quiet:
+        print(f"Random seed: {args.seed}")
     with tempfile.NamedTemporaryFile(delete=False) as tmp:
         tmp.write("ffconcat version 1.0\n".encode())
         t = 0
@@ -227,20 +243,45 @@ def generate_concat_file(videos: List[str], args: argparse.Namespace) -> str:
             framecount = get_video_frame_count(file)
             if framecount > 0:
                 tmp.write(f"file '{file}'\n".encode())
-                inpoint = round(random.random() * framecount * (1 - args.ignore / 100.0 * 2))
-                tmp.write(f"inpoint {get_timestamp(inpoint, args.framerate)}\n".encode())
+                inpoint = round(
+                    random.random() * framecount * (1 - args.ignore / 100.0 * 2)
+                )
+                tmp.write(
+                    f"inpoint {get_timestamp(inpoint, args.framerate)}\n".encode()
+                )
                 outpoint = inpoint + round(args.sample * args.framerate)
-                tmp.write(f"outpoint {get_timestamp(outpoint, args.framerate)}\n".encode())
+                tmp.write(
+                    f"outpoint {get_timestamp(outpoint, args.framerate)}\n".encode()
+                )
                 t += args.sample
+        if not args.quiet:
+            print(f"FFMPEG concat file: {tmp.name}")
         return tmp.name
 
-def make_output_video(concat_file: str, output_file: str, args: argparse.Namespace) -> None:
-    cmd = [
-        'ffmpeg', '-y', '-f', 'concat', '-safe', '0', '-i', concat_file, '-c:v', 'libx264', '-async', '1', '-an', output_file 
-    ]
-    execute_with_args(cmd, args)
 
-if __name__ == '__main__':
+def make_output_video(
+    concat_file: str, output_file: str, args: argparse.Namespace
+) -> None:
+    parameters = [
+        "-y",
+        "-f",
+        "concat",
+        "-safe",
+        "0",
+        "-i",
+        concat_file,
+        "-c:v",
+        "libx264",
+        "-async",
+        "1",
+        "-an",
+        output_file,
+    ]
+    if not ffmpeg(parameters, args):
+        sys.exit(1)
+
+
+if __name__ == "__main__":
     args = parse_args()
 
     output_file = get_output_file(args)
@@ -251,4 +292,5 @@ if __name__ == '__main__':
 
     concat_file = generate_concat_file(videos, args)
 
-    make_output_video(concat_file, output_file, args)
+    if not args.dry:
+        make_output_video(concat_file, output_file, args)

@@ -1,6 +1,4 @@
-usage: video-randomizer.py [-h] [-o OUTPUT] [-d DURATION] [-s SAMPLE] [-p HEIGHT] [-w WIDTH] [-f FRAMERATE] [-i IGNORE] [--dry] [-q] [-qf] [--crf CRF] [-r SEED]
-                           [--ffmpeg FFMPEG]
-                           file [file ...]
+usage: video-randomizer.py [-h] [-o OUTPUT] [-d DURATION] [-s SAMPLE] [-p HEIGHT] [-w WIDTH] [-f FRAMERATE] [-i IGNORE] [--dry] [-q] [-qf] [--crf CRF] [-r SEED] [--ffmpeg FFMPEG] file [file ...]
 
 randomize videos by taking small random samples and merging them together
 

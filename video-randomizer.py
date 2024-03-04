@@ -46,7 +46,7 @@ def parse_args() -> argparse.Namespace:
         "--height",
         type=int,
         default=None,
-        help="output video height (default: 1080p)",
+        help="output video height (default: 1080p if multiple videos)",
     )
     parser.add_argument(
         "-w",
@@ -58,9 +58,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "-f",
         "--framerate",
-        type=int,
-        default=30,
-        help="output video framerate (default: 30fps)",
+        type=float,
+        default=None,
+        help="output video framerate (default: 30fps if multiple videos)",
     )
     parser.add_argument(
         "-i",
@@ -108,6 +108,27 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="ffmpeg binary path (default is found on PATH)",
     )
+    parser.add_argument(
+        "-nc",
+        "--no-convert",
+        action="store_true",
+        default=False,
+        help="don't convert videos (default for one video, might fail on multiple)",
+    )
+    parser.add_argument(
+        "-na",
+        "--no-audio",
+        action="store_true",
+        default=False,
+        help="only keep video track",
+    )
+    parser.add_argument(
+        "-ab",
+        "--audio-bitrate",
+        type=int,
+        default=128,
+        help="audio bitrate in Kbps (default: 128)",
+    )
     parser.add_argument("file", type=str, nargs="+", help="input files")
     return parser.parse_args()
 
@@ -122,6 +143,12 @@ def get_file_hash(path: str) -> str:
 
 def get_video_frame_count(path: str) -> int:
     return cv2.VideoCapture(path).get(cv2.CAP_PROP_FRAME_COUNT)
+
+
+def get_framerate(path: str, args: argparse.Namespace) -> float:
+    if not args.no_convert:
+        return args.framerate
+    return cv2.VideoCapture(path).get(cv2.CAP_PROP_FPS)
 
 
 def get_timestamp(frame_number: int, framerate: float) -> str:
@@ -164,7 +191,21 @@ def get_scale(args: argparse.Namespace) -> str:
         return f"{args.width}:{args.height}"
 
 
+def no_convert(args: argparse.Namespace) -> bool:
+    if args.no_convert:
+        return True
+    if args.no_audio or args.width is not None or args.height is not None or args.framerate is not None:
+        return False
+    return len(args.file) == 1
+
+
 # === MAIN ===
+
+
+def fix_arguments(args: argparse.Namespace) -> argparse.Namespace:
+    args.no_convert = no_convert(args)
+    args.framerate = args.framerate if args.framerate is not None else 30
+    return args
 
 
 def get_output_file(args: argparse.Namespace) -> str:
@@ -175,9 +216,9 @@ def get_output_file(args: argparse.Namespace) -> str:
 
 def get_build_dir(args: argparse.Namespace) -> str:
     path = os.path.join(
-        os.getcwd(), f"build_{get_scale(args).replace(':','x')}_{args.framerate}fps"
+        os.getcwd(), f"build_{get_scale(args).replace(':','x')}_{args.framerate}fps{'_na' if args.no_audio else ''}"
     )
-    if not os.path.exists(path):
+    if not os.path.exists(path) and not args.no_convert:
         os.mkdir(path)
     return path
 
@@ -197,9 +238,12 @@ def convert_video(in_path: str, out_path: str, args: argparse.Namespace) -> bool
         str(args.crf),
         "-video_track_timescale",
         "90000",
-        "-an",
-        out_path,
     ]
+    if args.no_audio:
+        parameters += ["-an"]
+    else:
+        parameters += ["-c:a", "aac", "-b:a", f"{args.audio_bitrate}k"]
+    parameters += [out_path]
     return ffmpeg(parameters, args)
 
 
@@ -208,11 +252,14 @@ def convert_all_videos(build_dir: str, args: argparse.Namespace) -> typing.List[
     to_convert = []
     for path in args.file:
         if os.path.exists(path):
-            output_path = os.path.join(build_dir, get_file_hash(path) + ".mp4")
-            if os.path.exists(output_path):
-                converted += [output_path]
+            if args.no_convert:
+                converted += [os.path.realpath(path)]
             else:
-                to_convert += [(path, output_path)]
+                output_path = os.path.join(build_dir, get_file_hash(path) + ".mp4")
+                if os.path.exists(output_path):
+                    converted += [output_path]
+                else:
+                    to_convert += [(path, output_path)]
     if not args.quiet:
         print(f"Found {len(converted) + len(to_convert)} videos")
         print(f"{len(converted)} already converted")
@@ -241,17 +288,18 @@ def generate_concat_file(videos: typing.List[str], args: argparse.Namespace) -> 
         while t < args.duration:
             file = random.choice(videos)
             framecount = get_video_frame_count(file)
+            framerate = get_framerate(file, args)
             if framecount > 0:
                 tmp.write(f"file '{file}'\n".encode())
                 inpoint = round(
                     random.random() * framecount * (1 - args.ignore / 100.0 * 2)
                 )
                 tmp.write(
-                    f"inpoint {get_timestamp(inpoint, args.framerate)}\n".encode()
+                    f"inpoint {get_timestamp(inpoint, framerate)}\n".encode()
                 )
-                outpoint = inpoint + round(args.sample * args.framerate)
+                outpoint = inpoint + round(args.sample * framerate)
                 tmp.write(
-                    f"outpoint {get_timestamp(outpoint, args.framerate)}\n".encode()
+                    f"outpoint {get_timestamp(outpoint, framerate)}\n".encode()
                 )
                 t += args.sample
         if not args.quiet:
@@ -273,16 +321,21 @@ def make_output_video(
         "-c:v",
         "libx264",
         "-async",
-        "1",
-        "-an",
-        output_file,
+        "1"
     ]
+    if args.no_audio:
+        parameters += ["-an"]
+    else:
+        parameters += ["-c:a", "aac", "-b:a", f"{args.audio_bitrate}k"]
+    parameters += [output_file]
     if not ffmpeg(parameters, args):
         sys.exit(1)
 
 
 if __name__ == "__main__":
     args = parse_args()
+
+    args = fix_arguments(args)
 
     output_file = get_output_file(args)
 
